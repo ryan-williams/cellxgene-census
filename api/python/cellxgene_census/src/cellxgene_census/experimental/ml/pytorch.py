@@ -184,17 +184,19 @@ class _ObsAndXSOMAIterator(Iterator[_SOMAChunk]):
         return _SOMAChunk(obs=obs_batch, X=X_batch, stats=stats)
 
 
-def run_gc() -> Tuple[Tuple[Any, Any, Any], Tuple[Any, Any, Any]]:  # noqa: D103
+def run_gc() -> Tuple[Tuple[Any, Any, Any], Tuple[Any, Any, Any], float]:  # noqa: D103
     proc = psutil.Process(os.getpid())
 
     pre_gc = proc.memory_full_info(), psutil.virtual_memory(), psutil.swap_memory()
+    start = time()
     gc.collect()
+    gc_elapsed = time() - start
     post_gc = proc.memory_full_info(), psutil.virtual_memory(), psutil.swap_memory()
 
     pytorch_logger.debug(f"gc:  pre={pre_gc}")
     pytorch_logger.debug(f"gc: post={post_gc}")
 
-    return pre_gc, post_gc
+    return pre_gc, post_gc, gc_elapsed
 
 
 class _ObsAndXIterator(Iterator[ObsAndXDatum]):
@@ -241,6 +243,7 @@ class _ObsAndXIterator(Iterator[ObsAndXDatum]):
         self.return_sparse_X = return_sparse_X
         self.encoders = encoders
         self.stats = stats
+        self.gc_elapsed = 0
         self.max_process_mem_usage_bytes = 0
         self.X_dtype = X.schema[2].type.to_pandas_dtype()
 
@@ -298,14 +301,15 @@ class _ObsAndXIterator(Iterator[ObsAndXDatum]):
         if self.soma_chunk is None or not (0 <= self.i < len(self.soma_chunk)):
             # GC memory from previous soma_chunk
             self.soma_chunk = None
-            mem_info = run_gc()
-            self.max_process_mem_usage_bytes = max(self.max_process_mem_usage_bytes, mem_info[0][0].uss)
+            pre_gc, _, gc_elapsed = run_gc()
+            self.max_process_mem_usage_bytes = max(self.max_process_mem_usage_bytes, pre_gc[0].uss)
 
             self.soma_chunk: _SOMAChunk = next(self.soma_chunk_iter)
             self.stats += self.soma_chunk.stats
+            self.gc_elapsed += gc_elapsed
             self.i = 0
 
-            pytorch_logger.debug(f"Retrieved SOMA chunk totals: {self.stats}")
+            pytorch_logger.debug(f"Retrieved SOMA chunk totals: {self.stats}, gc_elapsed={timedelta(seconds=self.gc_elapsed)}")
 
         obs_batch = self.soma_chunk.obs
         X_batch = self.soma_chunk.X
