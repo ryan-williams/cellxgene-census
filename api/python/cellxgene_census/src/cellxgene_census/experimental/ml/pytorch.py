@@ -2,6 +2,7 @@ import gc
 import logging
 import os
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import timedelta
 from math import ceil
 from time import time
@@ -57,7 +58,7 @@ Encoders = Dict[str, LabelEncoder]
 """A dictionary of ``LabelEncoder``s keyed by the ``obs`` column name."""
 
 
-@define
+@dataclass
 class Stats:
     """Statistics about the data retrieved by ``ExperimentDataPipe`` via SOMA API. This is useful for assessing the read
     throughput of SOMA data.
@@ -78,6 +79,8 @@ class Stats:
     n_soma_chunks: int = 0
     """The number of chunks retrieved"""
 
+    checkpoints: list[dict] = field(default_factory=list)
+
     def __str__(self) -> str:
         return f"{self.n_soma_chunks=}, {self.n_obs=}, {self.nnz=}, " f"elapsed={timedelta(seconds=self.elapsed)}"
 
@@ -86,7 +89,11 @@ class Stats:
         self.nnz += other.nnz
         self.elapsed += other.elapsed
         self.n_soma_chunks += other.n_soma_chunks
+        self.checkpoints += other.checkpoints
         return self
+
+    def checkpoints_df(self) -> pd.DataFrame:
+        return pd.DataFrame(self.checkpoints)
 
 
 @contextmanager
@@ -99,6 +106,18 @@ def _open_experiment(
 
     with soma.Experiment.open(uri, context=context) as exp:
         yield exp
+
+
+class Timer:
+    def __init__(self):
+        self.times = {}
+        self.start = self.last = time()
+
+    def checkpoint(self, name):
+        now = time()
+        elapsed = now - self.last
+        self.times[name] = elapsed
+        self.last = time()
 
 
 class _ObsAndXSOMAIterator(Iterator[_SOMAChunk]):
@@ -141,10 +160,12 @@ class _ObsAndXSOMAIterator(Iterator[_SOMAChunk]):
 
     def __next__(self) -> _SOMAChunk:
         pytorch_logger.debug("Retrieving next SOMA chunk...")
-        start_time = time()
+        timer = Timer()
+        checkpoint = timer.checkpoint
 
         # If no more chunks to iterate through, raise StopIteration, as all iterators do when at end
         obs_joinids_chunk = next(self.obs_joinids_chunks_iter)
+        checkpoint("obs_joinids_chunk")
 
         obs_batch = (
             self.obs.read(
@@ -156,6 +177,7 @@ class _ObsAndXSOMAIterator(Iterator[_SOMAChunk]):
             .set_index("soma_joinid")
         )
         assert obs_batch.shape[0] == obs_joinids_chunk.shape[0]
+        checkpoint("obs_batch")
 
         # handle case of empty result (first batch has 0 rows)
         if len(obs_batch) == 0:
@@ -163,6 +185,7 @@ class _ObsAndXSOMAIterator(Iterator[_SOMAChunk]):
 
         # reorder obs rows to match obs_joinids_chunk ordering, which may be shuffled
         obs_batch = obs_batch.reindex(obs_joinids_chunk, copy=False)
+        checkpoint('obs_batch_reindex')
 
         # note: the `blockwise` call is employed for its ability to reindex the axes of the sparse matrix,
         # but the blockwise iteration feature is not used (block_size is set to retrieve the chunk as a single block)
@@ -171,14 +194,17 @@ class _ObsAndXSOMAIterator(Iterator[_SOMAChunk]):
             .blockwise(axis=0, size=len(obs_joinids_chunk), eager=False)
             .scipy(compress=True)
         )
+        checkpoint("scipy_iter")
         X_batch, _ = next(scipy_iter)
+        checkpoint("X_batch")
         assert obs_batch.shape[0] == X_batch.shape[0]
 
         stats = Stats()
         stats.n_obs += X_batch.shape[0]
         stats.nnz += X_batch.nnz
-        stats.elapsed += time() - start_time
+        stats.elapsed += time() - timer.start
         stats.n_soma_chunks += 1
+        stats.checkpoints.append(timer.times)
 
         pytorch_logger.debug(f"Retrieved SOMA chunk: {stats}")
         return _SOMAChunk(obs=obs_batch, X=X_batch, stats=stats)
