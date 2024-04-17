@@ -72,7 +72,7 @@ class Stats:
     nnz: int = 0
     """The total number of values retrieved"""
 
-    elapsed: int = 0
+    elapsed: float = 0
     """The total elapsed time in seconds for retrieving all batches"""
 
     n_soma_chunks: int = 0
@@ -177,7 +177,7 @@ class _ObsAndXSOMAIterator(Iterator[_SOMAChunk]):
         stats = Stats()
         stats.n_obs += X_batch.shape[0]
         stats.nnz += X_batch.nnz
-        stats.elapsed += int(time() - start_time)
+        stats.elapsed += time() - start_time
         stats.n_soma_chunks += 1
 
         pytorch_logger.debug(f"Retrieved SOMA chunk: {stats}")
