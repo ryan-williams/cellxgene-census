@@ -26,6 +26,7 @@ from torch import distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.dataset import Dataset
 
+from tiledbsoma.stats import profile
 from ... import get_default_soma_context
 from ..util._eager_iter import _EagerIterator
 
@@ -195,7 +196,8 @@ class _ObsAndXSOMAIterator(Iterator[_SOMAChunk]):
             .scipy(compress=True)
         )
         checkpoint("scipy_iter")
-        X_batch, _ = next(scipy_iter)
+        with profile("X_batch", append=True):
+            X_batch, _ = next(scipy_iter)
         checkpoint("X_batch")
         assert obs_batch.shape[0] == X_batch.shape[0]
 
