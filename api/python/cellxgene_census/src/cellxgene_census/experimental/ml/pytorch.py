@@ -7,6 +7,7 @@ from datetime import timedelta
 from math import ceil
 from time import time
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+import time as tpc
 
 import numpy as np
 import numpy.typing as npt
@@ -86,11 +87,11 @@ class Stats:
         return f"{self.n_soma_chunks=}, {self.n_obs=}, {self.nnz=}, " f"elapsed={timedelta(seconds=self.elapsed)}"
 
     def __add__(self, other: "Stats") -> "Stats":
-        self.n_obs += other.n_obs
-        self.nnz += other.nnz
-        self.elapsed += other.elapsed
-        self.n_soma_chunks += other.n_soma_chunks
-        self.checkpoints += other.checkpoints
+        # self.n_obs += other.n_obs
+        # self.nnz += other.nnz
+        # self.elapsed += other.elapsed
+        # self.n_soma_chunks += other.n_soma_chunks
+        # self.checkpoints += other.checkpoints
         return self
 
     def checkpoints_df(self) -> pd.DataFrame:
@@ -190,26 +191,32 @@ class _ObsAndXSOMAIterator(Iterator[_SOMAChunk]):
 
         # note: the `blockwise` call is employed for its ability to reindex the axes of the sparse matrix,
         # but the blockwise iteration feature is not used (block_size is set to retrieve the chunk as a single block)
-        scipy_iter = (
-            self.X.read(coords=(obs_joinids_chunk, self.var_joinids))
-            .blockwise(axis=0, size=len(obs_joinids_chunk), eager=False)
-            .scipy(compress=True)
-        )
+        # scipy_iter = (
+        #     self.X.read(coords=(obs_joinids_chunk, self.var_joinids))
+        #     # .blockwise(axis=0, size=len(obs_joinids_chunk), eager=False)
+        #     # .scipy(compress=True)
+        # )
         checkpoint("scipy_iter")
         with profile("X_batch", append=True):
-            X_batch, _ = next(scipy_iter)
-        checkpoint("X_batch")
-        assert obs_batch.shape[0] == X_batch.shape[0]
+            start = tpc.perf_counter()
+            print(f"pytorch CxG iterator next start:", start)
+            self.X.read(coords=(obs_joinids_chunk, self.var_joinids))
+            end = tpc.perf_counter()
+            print(f"pytorch CxG iterator next end duration:", end - start)
 
-        stats = Stats()
-        stats.n_obs += X_batch.shape[0]
-        stats.nnz += X_batch.nnz
-        stats.elapsed += time() - timer.start
-        stats.n_soma_chunks += 1
-        stats.checkpoints.append(timer.times)
+        # checkpoint("X_batch")
+        # assert obs_batch.shape[0] == X_batch.shape[0]
 
-        pytorch_logger.debug(f"Retrieved SOMA chunk: {stats}")
-        return _SOMAChunk(obs=obs_batch, X=X_batch, stats=stats)
+        # stats = Stats()
+        # stats.n_obs += X_batch.shape[0]
+        # stats.nnz += X_batch.nnz
+        # stats.elapsed += time() - timer.start
+        # stats.n_soma_chunks += 1
+        # stats.checkpoints.append(timer.times)
+
+        # pytorch_logger.debug(f"Retrieved SOMA chunk: {stats}")
+        #return _SOMAChunk(obs=obs_batch, X=X_batch, stats=stats)
+        return None
 
 
 def run_gc() -> Tuple[Tuple[Any, Any, Any], Tuple[Any, Any, Any]]:  # noqa: D103
@@ -333,29 +340,29 @@ class _ObsAndXIterator(Iterator[ObsAndXDatum]):
             self.max_process_mem_usage_bytes = max(self.max_process_mem_usage_bytes, pre_gc[0].uss)
 
             self.soma_chunk: _SOMAChunk = next(self.soma_chunk_iter)
-            self.stats += self.soma_chunk.stats
+            self.stats += None #self.soma_chunk.stats
             self.gc_elapsed += gc_elapsed
             self.i = 0
 
             pytorch_logger.debug(f"Retrieved SOMA chunk totals: {self.stats}, gc_elapsed={timedelta(seconds=self.gc_elapsed)}")
 
-        obs_batch = self.soma_chunk.obs
-        X_batch = self.soma_chunk.X
+        obs_batch = None #self.soma_chunk.obs
+        X_batch = None #self.soma_chunk.X
 
-        safe_batch_size = min(batch_size, len(obs_batch) - self.i)
-        slice_ = slice(self.i, self.i + safe_batch_size)
-        assert slice_.stop <= obs_batch.shape[0]
+        # safe_batch_size = min(batch_size, len(obs_batch) - self.i)
+        # slice_ = slice(self.i, self.i + safe_batch_size)
+        # assert slice_.stop <= obs_batch.shape[0]
 
-        obs_rows = obs_batch.iloc[slice_]
-        assert obs_rows.index.is_unique
-        assert safe_batch_size == obs_rows.shape[0]
+        # obs_rows = obs_batch.iloc[slice_]
+        # assert obs_rows.index.is_unique
+        # assert safe_batch_size == obs_rows.shape[0]
 
-        X_csr_scipy = X_batch[slice_]
-        assert obs_rows.shape[0] == X_csr_scipy.shape[0]
+        # X_csr_scipy = X_batch[slice_]
+        # assert obs_rows.shape[0] == X_csr_scipy.shape[0]
 
-        self.i += safe_batch_size
+        # self.i += safe_batch_size
 
-        return obs_rows, X_csr_scipy
+        return None, None #obs_rows, X_csr_scipy
 
 
 class ExperimentDataPipe(pipes.IterDataPipe[Dataset[ObsAndXDatum]]):  # type: ignore
