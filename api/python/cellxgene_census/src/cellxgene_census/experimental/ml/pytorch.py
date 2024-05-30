@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from math import ceil
 from time import time
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Literal
 
 import numpy as np
 import numpy.typing as npt
@@ -14,6 +14,8 @@ import pandas as pd
 import psutil
 import pyarrow as pa
 import scipy
+from scipy.sparse import coo_matrix
+
 import tiledbsoma as soma
 import torch
 import torchdata.datapipes.iter as pipes
@@ -121,6 +123,9 @@ class Timer:
         self.last = time()
 
 
+Fmt = Literal["arrow.coo", "scipy.csr", "scipy.coo"]
+
+
 class _ObsAndXSOMAIterator(Iterator[_SOMAChunk]):
     """Iterates the SOMA chunks of corresponding ``obs`` and ``X`` data. This is an internal class,
     not intended for public use.
@@ -142,12 +147,14 @@ class _ObsAndXSOMAIterator(Iterator[_SOMAChunk]):
         obs_joinids_chunked: List[npt.NDArray[np.int64]],
         var_joinids: npt.NDArray[np.int64],
         shuffle_rng: Optional[Generator] = None,
+        fmt: Fmt = 'scipy.csr',
     ):
         self.obs = obs
         self.X = X
         self.obs_column_names = obs_column_names
         self.obs_joinids_chunks_iter = self._maybe_local_shuffle_obs_joinids(obs_joinids_chunked, shuffle_rng)
         self.var_joinids = var_joinids
+        self.fmt = fmt
 
     @staticmethod
     def _maybe_local_shuffle_obs_joinids(
@@ -190,14 +197,24 @@ class _ObsAndXSOMAIterator(Iterator[_SOMAChunk]):
 
         # note: the `blockwise` call is employed for its ability to reindex the axes of the sparse matrix,
         # but the blockwise iteration feature is not used (block_size is set to retrieve the chunk as a single block)
-        scipy_iter = (
+        blockwise_iter = (
             self.X.read(coords=(obs_joinids_chunk, self.var_joinids))
             .blockwise(axis=0, size=len(obs_joinids_chunk), eager=False)
-            .scipy(compress=True)
         )
+
+        fmt = self.fmt
+        if fmt == 'arrow.coo':
+            batch_iter = blockwise_iter.tables()
+        elif fmt == 'scipy.coo':
+            batch_iter = blockwise_iter.scipy(compress=False)
+        elif fmt == 'scipy.csr':
+            batch_iter = blockwise_iter.scipy(compress=True)
+        else:
+            raise ValueError(f"Invalid format: {fmt}")
+
         checkpoint("scipy_iter")
         with profile("X_batch", append=True):
-            X_batch, _ = next(scipy_iter)
+            X_batch, _ = next(batch_iter)
         checkpoint("X_batch")
         assert obs_batch.shape[0] == X_batch.shape[0]
 
@@ -259,9 +276,10 @@ class _ObsAndXIterator(Iterator[ObsAndXDatum]):
         return_sparse_X: bool,
         use_eager_fetch: bool,
         shuffle_rng: Optional[Generator] = None,
+        fmt: Fmt = 'scipy.csr',
     ) -> None:
         self.soma_chunk_iter = _ObsAndXSOMAIterator(
-            obs, X, obs_column_names, obs_joinids_chunked, var_joinids, shuffle_rng
+            obs, X, obs_column_names, obs_joinids_chunked, var_joinids, shuffle_rng, fmt=fmt,
         )
         if use_eager_fetch:
             self.soma_chunk_iter = _EagerIterator(self.soma_chunk_iter)
@@ -350,12 +368,21 @@ class _ObsAndXIterator(Iterator[ObsAndXDatum]):
         assert obs_rows.index.is_unique
         assert safe_batch_size == obs_rows.shape[0]
 
-        X_csr_scipy = X_batch[slice_]
-        assert obs_rows.shape[0] == X_csr_scipy.shape[0]
+        if isinstance(X_batch, coo_matrix):
+            start = np.searchsorted(X_batch.row, slice_.start)
+            stop = np.searchsorted(X_batch.row, slice_.stop)
+            data = X_batch.data[start:stop]
+            row = X_batch.row[start:stop] - slice_.start
+            col = X_batch.col[start:stop]
+            shape = (slice_.stop - slice_.start, X_batch.shape[1])
+            X_scipy = coo_matrix((data, (row, col)), shape=shape)
+        else:
+            X_scipy = X_batch[slice_]
+        assert obs_rows.shape[0] == X_scipy.shape[0]
 
         self.i += safe_batch_size
 
-        return obs_rows, X_csr_scipy
+        return obs_rows, X_scipy
 
 
 class ExperimentDataPipe(pipes.IterDataPipe[Dataset[ObsAndXDatum]]):  # type: ignore
@@ -425,6 +452,7 @@ class ExperimentDataPipe(pipes.IterDataPipe[Dataset[ObsAndXDatum]]):  # type: ig
         return_sparse_X: bool = False,
         soma_chunk_size: Optional[int] = None,
         use_eager_fetch: bool = True,
+        fmt: Fmt = 'scipy.csr',
     ) -> None:
         r"""Construct a new ``ExperimentDataPipe``.
 
@@ -504,6 +532,7 @@ class ExperimentDataPipe(pipes.IterDataPipe[Dataset[ObsAndXDatum]]):  # type: ig
         self._var_joinids = None
         self._shuffle_rng = np.random.default_rng(seed) if shuffle else None
         self._initialized = False
+        self.fmt = fmt
 
         if "soma_joinid" not in self.obs_column_names:
             self.obs_column_names = ["soma_joinid", *self.obs_column_names]
@@ -618,6 +647,7 @@ class ExperimentDataPipe(pipes.IterDataPipe[Dataset[ObsAndXDatum]]):  # type: ig
                 return_sparse_X=self.return_sparse_X,
                 use_eager_fetch=self.use_eager_fetch,
                 shuffle_rng=self._shuffle_rng,
+                fmt=self.fmt,
             )
 
             yield from obs_and_x_iter
