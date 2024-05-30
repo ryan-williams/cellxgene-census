@@ -38,27 +38,6 @@ ObsAndXDatum = Tuple[Tensor, Tensor]
 The Tensors are rank 1 if ``batch_size`` is 1, otherwise the Tensors are rank 2."""
 
 
-@define
-class _SOMAChunk:
-    """Return type of ``_ObsAndXSOMAIterator`` that pairs a chunk of ``obs`` rows with the respective rows from the ``X``
-    matrix.
-
-    Lifecycle:
-        experimental
-    """
-
-    obs: pd.DataFrame
-    X: scipy.sparse.spmatrix
-    stats: "Stats"
-
-    def __len__(self) -> int:
-        return len(self.obs)
-
-
-Encoders = Dict[str, LabelEncoder]
-"""A dictionary of ``LabelEncoder``s keyed by the ``obs`` column name."""
-
-
 @dataclass
 class Stats:
     """Statistics about the data retrieved by ``ExperimentDataPipe`` via SOMA API. This is useful for assessing the read
@@ -95,6 +74,27 @@ class Stats:
 
     def checkpoints_df(self) -> pd.DataFrame:
         return pd.DataFrame(self.checkpoints)
+
+
+@define
+class _SOMAChunk:
+    """Return type of ``_ObsAndXSOMAIterator`` that pairs a chunk of ``obs`` rows with the respective rows from the ``X``
+    matrix.
+
+    Lifecycle:
+        experimental
+    """
+
+    obs: pd.DataFrame
+    X: scipy.sparse.spmatrix
+    stats: Stats
+
+    def __len__(self) -> int:
+        return len(self.obs)
+
+
+Encoders = Dict[str, LabelEncoder]
+"""A dictionary of ``LabelEncoder``s keyed by the ``obs`` column name."""
 
 
 @contextmanager
