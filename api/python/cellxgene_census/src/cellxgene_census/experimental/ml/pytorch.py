@@ -1,20 +1,21 @@
 import gc
 import logging
 import os
+import typing
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
 from math import ceil
 from time import time
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Literal
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Literal, Union
 
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
 import psutil
 import pyarrow as pa
-import scipy
-from scipy.sparse import coo_matrix
+from pyarrow import Table
+from scipy.sparse import coo_matrix, csr_matrix
 
 import tiledbsoma as soma
 import torch
@@ -38,6 +39,9 @@ pytorch_logger = logging.getLogger("cellxgene_census.experimental.pytorch")
 ObsAndXDatum = Tuple[Tensor, Tensor]
 """Return type of ``ExperimentDataPipe`` that pairs a Tensor of ``obs`` row(s) with a Tensor of ``X`` matrix row(s).
 The Tensors are rank 1 if ``batch_size`` is 1, otherwise the Tensors are rank 2."""
+
+
+ChunkX = Union[np.array, csr_matrix, coo_matrix]
 
 
 @dataclass
@@ -88,7 +92,7 @@ class _SOMAChunk:
     """
 
     obs: pd.DataFrame
-    X: scipy.sparse.spmatrix
+    X: ChunkX
     stats: Stats
 
     def __len__(self) -> int:
@@ -123,7 +127,18 @@ class Timer:
         self.last = time()
 
 
-Fmt = Literal["arrow.coo", "scipy.csr", "scipy.coo"]
+Fmt = Literal["np.array", "scipy.csr", "scipy.coo"]
+
+
+def tables_to_np(tables: Iterator[Tuple[Table, any]], shape: Tuple[int, int]) -> typing.Generator[Tuple[np.ndarray, any, int], None, None]:
+    for tbl, indices in tables:
+        row_indices_np = np.array(tbl.columns[0])
+        col_indices_np = np.array(tbl.columns[1])
+        data_np = np.array(tbl.columns[2])
+        nnz = len(data_np)
+        dense_matrix = np.zeros(shape, dtype=data_np.dtype)
+        dense_matrix[row_indices_np, col_indices_np] = data_np
+        yield dense_matrix, indices, nnz
 
 
 class _ObsAndXSOMAIterator(Iterator[_SOMAChunk]):
@@ -203,8 +218,8 @@ class _ObsAndXSOMAIterator(Iterator[_SOMAChunk]):
         )
 
         fmt = self.fmt
-        if fmt == 'arrow.coo':
-            batch_iter = blockwise_iter.tables()
+        if fmt == 'np.array':
+            batch_iter = tables_to_np(blockwise_iter.tables(), shape=(obs_batch.shape[0], len(self.var_joinids)))
         elif fmt == 'scipy.coo':
             batch_iter = blockwise_iter.scipy(compress=False)
         elif fmt == 'scipy.csr':
@@ -214,13 +229,18 @@ class _ObsAndXSOMAIterator(Iterator[_SOMAChunk]):
 
         checkpoint("scipy_iter")
         with profile("X_batch", append=True):
-            X_batch, _ = next(batch_iter)
+            res = next(batch_iter)
+            X_batch: ChunkX = res[0]
+            if isinstance(X_batch, np.ndarray):
+                nnz = res[2]
+            else:
+                nnz = X_batch.nnz
         checkpoint("X_batch")
         assert obs_batch.shape[0] == X_batch.shape[0]
 
         stats = Stats()
         stats.n_obs += X_batch.shape[0]
-        stats.nnz += X_batch.nnz
+        stats.nnz += nnz
         stats.elapsed += time() - timer.start
         stats.n_soma_chunks += 1
         stats.checkpoints.append(timer.times)
@@ -296,13 +316,19 @@ class _ObsAndXIterator(Iterator[ObsAndXDatum]):
     def __next__(self) -> ObsAndXDatum:
         """Read the next torch batch, possibly across multiple soma chunks."""
         obs: pd.DataFrame = pd.DataFrame()
-        X: sparse.csr_matrix = sparse.csr_matrix((0, len(self.var_joinids)), dtype=self.X_dtype)
+        X: ChunkX = csr_matrix((0, len(self.var_joinids)), dtype=self.X_dtype)
+        first = True
 
         while len(obs) < self.batch_size:
             try:
                 obs_partial, X_partial = self._read_partial_torch_batch(self.batch_size - len(obs))
-                obs = pd.concat([obs, obs_partial], axis=0)
-                X = sparse.vstack([X, X_partial])
+                if first:
+                    obs = obs_partial
+                    X = X_partial
+                    first = False
+                else:
+                    obs = pd.concat([obs, obs_partial], axis=0)
+                    X = sparse.vstack([X, X_partial])
             except StopIteration:
                 break
 
@@ -322,7 +348,9 @@ class _ObsAndXIterator(Iterator[ObsAndXDatum]):
         obs_tensor = torch.from_numpy(obs_encoded.to_numpy())
 
         if not self.return_sparse_X:
-            X_tensor = torch.from_numpy(X.todense())
+            if isinstance(X, (csr_matrix, coo_matrix)):
+                X = X.todense()
+            X_tensor = torch.from_numpy(X)
         else:
             coo = X.tocoo()
 
@@ -339,7 +367,7 @@ class _ObsAndXIterator(Iterator[ObsAndXDatum]):
 
         return X_tensor, obs_tensor
 
-    def _read_partial_torch_batch(self, batch_size: int) -> ObsAndXDatum:
+    def _read_partial_torch_batch(self, batch_size: int) -> Tuple[pd.DataFrame, ChunkX]:
         """Reads a torch-size batch of data from the current SOMA chunk, returning a torch-size batch whose size may
         contain fewer rows than the requested ``batch_size``. This can happen when the remaining rows in the current
         SOMA chunk are fewer than the requested ``batch_size``.
@@ -358,7 +386,7 @@ class _ObsAndXIterator(Iterator[ObsAndXDatum]):
             pytorch_logger.debug(f"Retrieved SOMA chunk totals: {self.stats}, gc_elapsed={timedelta(seconds=self.gc_elapsed)}")
 
         obs_batch = self.soma_chunk.obs
-        X_batch = self.soma_chunk.X
+        X_chunk = self.soma_chunk.X
 
         safe_batch_size = min(batch_size, len(obs_batch) - self.i)
         slice_ = slice(self.i, self.i + safe_batch_size)
@@ -368,21 +396,22 @@ class _ObsAndXIterator(Iterator[ObsAndXDatum]):
         assert obs_rows.index.is_unique
         assert safe_batch_size == obs_rows.shape[0]
 
-        if isinstance(X_batch, coo_matrix):
-            start = np.searchsorted(X_batch.row, slice_.start)
-            stop = np.searchsorted(X_batch.row, slice_.stop)
-            data = X_batch.data[start:stop]
-            row = X_batch.row[start:stop] - slice_.start
-            col = X_batch.col[start:stop]
-            shape = (slice_.stop - slice_.start, X_batch.shape[1])
-            X_scipy = coo_matrix((data, (row, col)), shape=shape)
+        if isinstance(X_chunk, coo_matrix):
+            start = np.searchsorted(X_chunk.row, slice_.start)
+            stop = np.searchsorted(X_chunk.row, slice_.stop)
+            data = X_chunk.data[start:stop]
+            row = X_chunk.row[start:stop] - slice_.start
+            col = X_chunk.col[start:stop]
+            shape = (slice_.stop - slice_.start, X_chunk.shape[1])
+            X_batch = coo_matrix((data, (row, col)), shape=shape)
         else:
-            X_scipy = X_batch[slice_]
-        assert obs_rows.shape[0] == X_scipy.shape[0]
+            X_batch = X_chunk[slice_]
+
+        assert obs_rows.shape[0] == X_batch.shape[0]
 
         self.i += safe_batch_size
 
-        return obs_rows, X_scipy
+        return obs_rows, X_batch
 
 
 class ExperimentDataPipe(pipes.IterDataPipe[Dataset[ObsAndXDatum]]):  # type: ignore
