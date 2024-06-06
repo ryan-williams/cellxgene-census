@@ -39,11 +39,11 @@ The Tensors are rank 1 if ``batch_size`` is 1, otherwise the Tensors are rank 2.
 
 
 # Various "methods" for converting from TileDB COO (on disk) to `torch.Tensor`
-Method = Literal["np.array", "scipy.csr", "scipy.coo"]
+Method = Literal["np.array", "scipy.csr"]
 
 
 # "Chunk" of X data, returned by each `Method` above
-ChunkX = Union[np.array, csr_matrix, coo_matrix]
+ChunkX = Union[np.array, csr_matrix]
 
 
 @define
@@ -205,8 +205,6 @@ class _ObsAndXSOMAIterator(Iterator[_SOMAChunk]):
         method = self.method
         if method == "np.array":
             batch_iter = tables_to_np(blockwise_iter.tables(), shape=(obs_batch.shape[0], len(self.var_joinids)))
-        elif method == "scipy.coo":
-            batch_iter = blockwise_iter.scipy(compress=False)
         elif method == "scipy.csr":
             batch_iter = blockwise_iter.scipy(compress=True)
         else:
@@ -355,7 +353,7 @@ class _ObsAndXIterator(Iterator[ObsAndXDatum]):
         obs_tensor = torch.from_numpy(obs_encoded.to_numpy())
 
         if not self.return_sparse_X:
-            if isinstance(X, (csr_matrix, coo_matrix)):
+            if isinstance(X, csr_matrix):
                 X = X.todense()
             X_tensor = torch.from_numpy(X)
         else:
@@ -405,17 +403,7 @@ class _ObsAndXIterator(Iterator[ObsAndXDatum]):
         assert obs_rows.index.is_unique
         assert safe_batch_size == obs_rows.shape[0]
 
-        if isinstance(X_chunk, coo_matrix):
-            start = np.searchsorted(X_chunk.row, slice_.start)
-            stop = np.searchsorted(X_chunk.row, slice_.stop)
-            data = X_chunk.data[start:stop]
-            row = X_chunk.row[start:stop] - slice_.start
-            col = X_chunk.col[start:stop]
-            shape = (slice_.stop - slice_.start, X_chunk.shape[1])
-            X_batch = coo_matrix((data, (row, col)), shape=shape)
-        else:
-            X_batch = X_chunk[slice_]
-
+        X_batch = X_chunk[slice_]
         assert obs_rows.shape[0] == X_batch.shape[0]
 
         self.i += safe_batch_size
