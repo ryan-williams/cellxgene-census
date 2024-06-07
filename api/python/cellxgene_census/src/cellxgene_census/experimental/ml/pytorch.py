@@ -334,7 +334,10 @@ class _ObsAndXIterator(Iterator[ObsAndXDatum]):
                     first = False
                 else:
                     obs = pd.concat([obs, obs_partial], axis=0)
-                    X = sparse.vstack([X, X_partial])
+                    if isinstance(X, np.ndarray):
+                        X = np.vstack([X, X_partial])
+                    else:
+                        X = sparse.vstack([X, X_partial])
             except StopIteration:
                 break
 
