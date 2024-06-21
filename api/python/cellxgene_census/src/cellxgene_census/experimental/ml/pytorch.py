@@ -1,4 +1,3 @@
-import gc
 import logging
 import os
 import typing
@@ -11,7 +10,6 @@ from typing import Any, Dict, Iterator, List, Literal, Optional, Sequence, Tuple
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
-import psutil
 import pyarrow as pa
 import tiledbsoma as soma
 import torch
@@ -20,7 +18,7 @@ from attr import define
 from numpy.random import Generator
 from pyarrow import Table
 from scipy import sparse
-from scipy.sparse import coo_matrix, csr_matrix
+from scipy.sparse import csr_matrix
 from sklearn.preprocessing import LabelEncoder
 from torch import Tensor
 from torch import distributed as dist
@@ -29,6 +27,7 @@ from torch.utils.data.dataset import Dataset
 
 from ... import get_default_soma_context
 from ..util._eager_iter import _EagerIterator
+from ..util.gc import Gc
 
 pytorch_logger = logging.getLogger("cellxgene_census.experimental.pytorch")
 
@@ -247,21 +246,6 @@ def list_split(arr_list: List[Any], sublist_len: int) -> List[List[Any]]:
     return result
 
 
-def run_gc() -> Tuple[Tuple[Any, Any, Any], Tuple[Any, Any, Any], float]:  # noqa: D103
-    proc = psutil.Process(os.getpid())
-
-    pre_gc = proc.memory_full_info(), psutil.virtual_memory(), psutil.swap_memory()
-    start = time()
-    gc.collect()
-    gc_elapsed = time() - start
-    post_gc = proc.memory_full_info(), psutil.virtual_memory(), psutil.swap_memory()
-
-    pytorch_logger.debug(f"gc:  pre={pre_gc}")
-    pytorch_logger.debug(f"gc: post={post_gc}")
-
-    return pre_gc, post_gc, gc_elapsed
-
-
 class _ObsAndXIterator(Iterator[ObsAndXDatum]):
     """Iterates through a set of ``obs`` and corresponding ``X`` rows, where the rows to be returned are specified by
     the ``obs_tables_iter`` argument. For the specified ``obs` rows, the corresponding ``X`` data is loaded and
@@ -296,6 +280,7 @@ class _ObsAndXIterator(Iterator[ObsAndXDatum]):
         shuffle_chunk_count: Optional[int] = None,
         shuffle_rng: Optional[Generator] = None,
         method: Method = "scipy.csr",
+        max_batches: Optional[int] = None
     ) -> None:
         self.soma_chunk_iter = _ObsAndXSOMAIterator(
             obs,
@@ -318,9 +303,17 @@ class _ObsAndXIterator(Iterator[ObsAndXDatum]):
         self.gc_elapsed = 0
         self.max_process_mem_usage_bytes = 0
         self.X_dtype = X.schema[2].type.to_pandas_dtype()
+        self.batch_idx = 0
+        self.max_batches = max_batches
 
     def __next__(self) -> ObsAndXDatum:
         """Read the next torch batch, possibly across multiple soma chunks."""
+        if self.max_batches and self.batch_idx >= self.max_batches:
+            self.soma_chunk = None
+            self.gc()
+            raise StopIteration
+        self.batch_idx += 1
+
         obs: pd.DataFrame = pd.DataFrame()
         X: ChunkX = csr_matrix((0, len(self.var_joinids)), dtype=self.X_dtype)
         first = True
@@ -376,6 +369,12 @@ class _ObsAndXIterator(Iterator[ObsAndXDatum]):
 
         return X_tensor, obs_tensor
 
+    def gc(self):
+        gc = Gc.snapshot(pytorch_logger)
+        self.max_process_mem_usage_bytes = max(self.max_process_mem_usage_bytes, gc.pre.memory_full_info.uss)
+        self.gc_elapsed += gc.elapsed
+        return gc
+
     def _read_partial_torch_batch(self, batch_size: int) -> Tuple[pd.DataFrame, ChunkX]:
         """Reads a torch-size batch of data from the current SOMA chunk, returning a torch-size batch whose size may
         contain fewer rows than the requested ``batch_size``. This can happen when the remaining rows in the current
@@ -384,12 +383,10 @@ class _ObsAndXIterator(Iterator[ObsAndXDatum]):
         if self.soma_chunk is None or not (0 <= self.i < len(self.soma_chunk)):
             # GC memory from previous soma_chunk
             self.soma_chunk = None
-            pre_gc, _, gc_elapsed = run_gc()
-            self.max_process_mem_usage_bytes = max(self.max_process_mem_usage_bytes, pre_gc[0].uss)
+            self.gc()
 
             self.soma_chunk: _SOMAChunk = next(self.soma_chunk_iter)
             self.stats += self.soma_chunk.stats
-            self.gc_elapsed += gc_elapsed
             self.i = 0
 
             pytorch_logger.debug(
@@ -484,6 +481,7 @@ class ExperimentDataPipe(pipes.IterDataPipe[Dataset[ObsAndXDatum]]):  # type: ig
         use_eager_fetch: bool = True,
         shuffle_chunk_count: Optional[int] = 2000,
         method: Method = "scipy.csr",
+        max_batches: Optional[int] = None,
     ) -> None:
         r"""Construct a new ``ExperimentDataPipe``.
 
@@ -565,6 +563,7 @@ class ExperimentDataPipe(pipes.IterDataPipe[Dataset[ObsAndXDatum]]):  # type: ig
         self._initialized = False
         self.method = method
         self.max_process_mem_usage_bytes = 0
+        self.max_batches = max_batches
 
         if "soma_joinid" not in self.obs_column_names:
             self.obs_column_names = ["soma_joinid", *self.obs_column_names]
@@ -681,6 +680,7 @@ class ExperimentDataPipe(pipes.IterDataPipe[Dataset[ObsAndXDatum]]):  # type: ig
                 shuffle_rng=self._shuffle_rng,
                 shuffle_chunk_count=self._shuffle_chunk_count,
                 method=self.method,
+                max_batches=self.max_batches,
             )
 
             yield from obs_and_x_iter
