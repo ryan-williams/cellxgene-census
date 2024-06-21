@@ -37,12 +37,12 @@ ObsAndXDatum = Tuple[Tensor, Tensor]
 The Tensors are rank 1 if ``batch_size`` is 1, otherwise the Tensors are rank 2."""
 
 
-# Various "methods" for converting from TileDB COO (on disk) to `torch.Tensor`
-Method = Literal["np.array", "scipy.csr"]
-METHODS = ["np.array", "scipy.csr"]
+# Strategies for converting from TileDB COO (on disk) to `torch.Tensor`
+ChunkMethod = Literal["np.array", "scipy.csr"]
+CHUNK_METHODS = ["np.array", "scipy.csr"]
 
 
-# "Chunk" of X data, returned by each `Method` above
+# "Chunk" of X data, returned by `ChunkMethod`s above
 ChunkX = Union[np.array, csr_matrix]
 
 
@@ -146,7 +146,7 @@ class _ObsAndXSOMAIterator(Iterator[_SOMAChunk]):
         var_joinids: npt.NDArray[np.int64],
         shuffle_chunk_count: Optional[int] = None,
         shuffle_rng: Optional[Generator] = None,
-        method: Method = "scipy.csr",
+        chunk_method: ChunkMethod = "scipy.csr",
     ):
         self.obs = obs
         self.X = X
@@ -169,7 +169,7 @@ class _ObsAndXSOMAIterator(Iterator[_SOMAChunk]):
             self.obs_joinids_chunks_iter = iter(obs_joinids_chunked)
         self.var_joinids = var_joinids
         self.shuffle_chunk_count = shuffle_chunk_count
-        self.method = method
+        self.chunk_method = chunk_method
 
     def __next__(self) -> _SOMAChunk:
         pytorch_logger.debug("Retrieving next SOMA chunk...")
@@ -202,13 +202,13 @@ class _ObsAndXSOMAIterator(Iterator[_SOMAChunk]):
             axis=0, size=len(obs_joinids_chunk), eager=False
         )
 
-        method = self.method
-        if method == "np.array":
+        chunk_method = self.chunk_method
+        if chunk_method == "np.array":
             batch_iter = tables_to_np(blockwise_iter.tables(), shape=(obs_batch.shape[0], len(self.var_joinids)))
-        elif method == "scipy.csr":
+        elif chunk_method == "scipy.csr":
             batch_iter = blockwise_iter.scipy(compress=True)
         else:
-            raise ValueError(f"Invalid format: {method}")
+            raise ValueError(f"Invalid format: {chunk_method}")
 
         res = next(batch_iter)
         X_batch: ChunkX = res[0]
@@ -279,7 +279,7 @@ class _ObsAndXIterator(Iterator[ObsAndXDatum]):
         use_eager_fetch: bool,
         shuffle_chunk_count: Optional[int] = None,
         shuffle_rng: Optional[Generator] = None,
-        method: Method = "scipy.csr",
+        chunk_method: ChunkMethod = "scipy.csr",
         max_batches: Optional[int] = None
     ) -> None:
         self.soma_chunk_iter = _ObsAndXSOMAIterator(
@@ -290,7 +290,7 @@ class _ObsAndXIterator(Iterator[ObsAndXDatum]):
             var_joinids,
             shuffle_chunk_count,
             shuffle_rng,
-            method=method,
+            chunk_method=chunk_method,
         )
         if use_eager_fetch:
             self.soma_chunk_iter = _EagerIterator(self.soma_chunk_iter)
@@ -480,7 +480,7 @@ class ExperimentDataPipe(pipes.IterDataPipe[Dataset[ObsAndXDatum]]):  # type: ig
         soma_chunk_size: Optional[int] = 64,
         use_eager_fetch: bool = True,
         shuffle_chunk_count: Optional[int] = 2000,
-        method: Method = "scipy.csr",
+        chunk_method: ChunkMethod = "scipy.csr",
         max_batches: Optional[int] = None,
     ) -> None:
         r"""Construct a new ``ExperimentDataPipe``.
@@ -561,7 +561,7 @@ class ExperimentDataPipe(pipes.IterDataPipe[Dataset[ObsAndXDatum]]):  # type: ig
         self._shuffle_chunk_count = shuffle_chunk_count if shuffle else None
         self._shuffle_rng = np.random.default_rng(seed) if shuffle else None
         self._initialized = False
-        self.method = method
+        self.chunk_method = chunk_method
         self.max_process_mem_usage_bytes = 0
         self.max_batches = max_batches
 
@@ -679,7 +679,7 @@ class ExperimentDataPipe(pipes.IterDataPipe[Dataset[ObsAndXDatum]]):  # type: ig
                 use_eager_fetch=self.use_eager_fetch,
                 shuffle_rng=self._shuffle_rng,
                 shuffle_chunk_count=self._shuffle_chunk_count,
-                method=self.method,
+                chunk_method=self.chunk_method,
                 max_batches=self.max_batches,
             )
 
