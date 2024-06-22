@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=64", "setuptools_scm[toml]>=8"]
+requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "cellxgene-census"
-dynamic = ["version"]
+version = "1.14.1.1"
 description = "API to facilitate the use of the CZ CELLxGENE Discover Census. For more information about the API and the project visit https://github.com/chanzuckerberg/cellxgene-census/"
 authors = [
     { name = "Chan Zuckerberg Initiative Foundation", email = "soma@chanzuckerberg.com" }
@@ -71,9 +71,6 @@ exclude = ["tests*"]  # exclude packages matching these glob patterns (empty by 
 
 [tool.setuptools.package-data]
 "cellxgene_census" = ["py.typed"]
-
-[tool.setuptools_scm]
-root = "../../.."
 
 [tool.ruff]
 line-length = 120

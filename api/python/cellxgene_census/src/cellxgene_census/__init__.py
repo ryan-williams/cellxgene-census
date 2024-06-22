@@ -35,12 +35,7 @@ from ._release_directory import (
     get_census_version_directory,
 )
 
-try:
-    __version__ = metadata.version("cellxgene_census")
-except metadata.PackageNotFoundError:
-    # package is not installed
-    __version__ = "0.0.0-unknown"
-
+__version__ = "1.14.1.1"
 __all__ = [
     "download_source_h5ad",
     "get_anndata",
