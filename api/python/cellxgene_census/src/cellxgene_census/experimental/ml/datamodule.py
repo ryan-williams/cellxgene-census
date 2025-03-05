@@ -1,18 +1,19 @@
 import torch
 from lightning.pytorch import LightningDataModule
+from tiledbsoma_ml import ExperimentDataset
 
 from .encoders import BatchEncoder
-from .pytorch import ExperimentDataPipe, experiment_dataloader
+from .pytorch import experiment_dataloader
 
 
 class CensusSCVIDataModule(LightningDataModule):
-    """Lightning data module for training an scVI model using the ExperimentDataPipe.
+    """Lightning data module for training an scVI model using the ExperimentDataset.
 
     Parameters
     ----------
     *args
         Positional arguments passed to
-        :class:`~cellxgene_census.experimental.ml.pytorch.ExperimentDataPipe`.
+        :class:`~tiledbsoma_ml.ExperimentDataset`.
     batch_keys
         List of obs column names concatenated to form the batch column.
     train_size
@@ -24,7 +25,7 @@ class CensusSCVIDataModule(LightningDataModule):
         :func:`~cellxgene_census.experimental.ml.pytorch.experiment_dataloader`.
     **kwargs
         Additional keyword arguments passed into
-        :class:`~cellxgene_census.experimental.ml.pytorch.ExperimentDataPipe`. Must not include
+        :class:`~tiledbsoma_ml.ExperimentDataset`. Must not include
         ``obs_column_names``.
     """
 
@@ -63,7 +64,7 @@ class CensusSCVIDataModule(LightningDataModule):
 
     @property
     def obs_column_names(self) -> list[str]:
-        """Passed to :class:`~cellxgene_census.experimental.ml.pytorch.ExperimentDataPipe`."""
+        """Passed to :class:`~tiledbsoma_ml.ExperimentDataset`."""
         if hasattr(self, "_obs_column_names"):
             return self._obs_column_names
 
@@ -111,7 +112,7 @@ class CensusSCVIDataModule(LightningDataModule):
 
     @property
     def weights(self) -> dict[str, float]:
-        """Passed to :meth:`~cellxgene_census.experimental.ml.ExperimentDataPipe.random_split`."""
+        """Passed to :meth:`~tiledbsoma_ml.ExperimentDataset.random_split`."""
         if not hasattr(self, "_weights"):
             self._weights = {self._TRAIN_KEY: self.train_size}
             if self.validation_size > 0.0:
@@ -119,34 +120,34 @@ class CensusSCVIDataModule(LightningDataModule):
         return self._weights
 
     @property
-    def datapipe(self) -> ExperimentDataPipe:
+    def dataset(self) -> ExperimentDataset:
         """Experiment data pipe."""
-        if not hasattr(self, "_datapipe"):
+        if not hasattr(self, "_dataset"):
             encoder = BatchEncoder(self.obs_column_names)
-            self._datapipe = ExperimentDataPipe(
+            self._dataset = ExperimentDataset(
                 *self.datapipe_args,
                 encoders=[encoder],
                 **self.datapipe_kwargs,
             )
-        return self._datapipe
+        return self._dataset
 
     def setup(self, stage: str | None = None):
         """Set up the train and validation data pipes."""
-        datapipes = self.datapipe.random_split(weights=self.weights, seed=self.split_seed)
-        self._train_datapipe = datapipes[0]
+        datapipes = self.dataset.random_split(*self.weights, seed=self.split_seed)
+        self._train_dataset = datapipes[0]
         if self.validation_size > 0.0:
-            self._validation_datapipe = datapipes[1]
+            self._validation_dataset = datapipes[1]
         else:
-            self._validation_datapipe = None
+            self._validation_dataset = None
 
     def train_dataloader(self):
         """Training data loader."""
-        return experiment_dataloader(self._train_datapipe, **self.dataloader_kwargs)
+        return experiment_dataloader(self._train_dataset, **self.dataloader_kwargs)
 
     def val_dataloader(self):
         """Validation data loader."""
-        if self._validation_datapipe is not None:
-            return experiment_dataloader(self._validation_datapipe, **self.dataloader_kwargs)
+        if self._validation_dataset is not None:
+            return experiment_dataloader(self._validation_dataset, **self.dataloader_kwargs)
 
     @property
     def n_obs(self) -> int:
@@ -154,14 +155,14 @@ class CensusSCVIDataModule(LightningDataModule):
 
         Necessary in scvi-tools to compute a heuristic of ``max_epochs``.
         """
-        return self.datapipe.shape[0]
+        return self.dataset.shape[0]
 
     @property
     def n_vars(self) -> int:
         """Number of features in the query.
         Necessary in scvi-tools to initialize the actual layers in the model.
         """
-        return self.datapipe.shape[1]
+        return self.dataset.shape[1]
 
     @property
     def n_batch(self) -> int:
@@ -172,7 +173,7 @@ class CensusSCVIDataModule(LightningDataModule):
 
     def get_n_classes(self, key: str) -> int:
         """Return the number of classes for a given obs column."""
-        return len(self.datapipe.obs_encoders[key].classes_)
+        return len(self.dataset.obs_encoders[key].classes_)
 
     def on_before_batch_transfer(
         self,
